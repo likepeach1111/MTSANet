@@ -1,0 +1,422 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def keep_topk_edges(adj, keep_ratio=0.3):
+    #图稀疏化，仅保留权重最大的前 keep_ratio 比例的连接，其余置为0
+    B, N, _ = adj.shape  
+    adj_abs = torch.abs(adj)  
+    flat_adj = adj_abs.view(B, -1)  
+    k = int(N * N * keep_ratio)  
+    threshold, _ = torch.topk(flat_adj, k, dim=-1)  
+    threshold = threshold[:, -1].view(B, 1, 1)  
+    mask = (adj_abs >= threshold).float()  
+    return adj_abs * mask  
+
+
+def normalize_adj_batch(adj):
+    #批量图邻接矩阵的对称归一化 
+    B, N, N = adj.shape
+    adj_abs = torch.abs(adj)
+    adj_with_loops = adj_abs + torch.eye(N).unsqueeze(0).to(adj.device)  
+    degree = adj_with_loops.sum(dim=-1)  
+    d_inv_sqrt = torch.pow(degree + 1e-8, -0.5) 
+    d_mat_inv_sqrt = torch.diag_embed(d_inv_sqrt)  
+    norm_adj = torch.matmul(torch.matmul(d_mat_inv_sqrt, adj_with_loops), d_mat_inv_sqrt)
+    return norm_adj
+
+
+class GraphConvolution(nn.Module):
+
+    def __init__(self, in_features, out_features):
+        super(GraphConvolution, self).__init__()
+        # 定义可学习的权重矩阵 W 
+        self.weight = nn.Parameter(torch.FloatTensor(in_features, out_features))
+        # 定义可学习的偏置向量 b 
+        self.bias = nn.Parameter(torch.FloatTensor(out_features))
+        nn.init.xavier_uniform_(self.weight)  
+        nn.init.zeros_(self.bias)
+
+    def forward(self, x, adj):
+        support = torch.matmul(x, self.weight)  # 节点特征线性变换
+        output = torch.matmul(adj, support) + self.bias  # 邻居聚合与偏置加法
+        return output
+
+
+class TJGModule(nn.Module):
+    #拓扑联合图学习模块 (Topology Joint Graph)。基于最优传输(Optimal Transport, Sinkhorn迭代)。
+    def __init__(self, alpha=0.5, beta=1e-3, epsilon=0.1, max_iter=15):
+        super(TJGModule, self).__init__()
+
+        self.alpha = alpha
+        self.beta = beta
+        self.epsilon = epsilon  
+        self.max_iter = max_iter  
+
+    def compute_pagerank_batch(self, A, d=0.85, max_iter=20):
+    #操作：计算 PageRank 中心性，用于定义最优传输的边缘分布(源与目标的质量)。
+        B, N, _ = A.shape
+        A_abs = torch.abs(A)
+        deg = A_abs.sum(dim=-1, keepdim=True) + 1e-8  # 节点度
+        M = A_abs / deg  # 状态转移矩阵
+        h = torch.ones(B, N, 1, device=A.device) / N  
+        for _ in range(max_iter):
+            h = d * torch.matmul(M.transpose(-1, -2), h) + (1 - d) / N
+        return h.squeeze(-1)  
+
+    def compute_shortest_path(self, A):
+        #将单跳邻接矩阵转化为全局最短路径矩阵
+        B, N, _ = A.shape
+        # 将连接强度转化为距离：连接越强，距离越接近 0
+        D = 1.0 - torch.abs(A)
+
+        idx = torch.arange(N)
+        D[:, idx, idx] = 0.0
+
+        for k in range(N):
+            # D[i, j] = min(D[i, j], D[i, k] + D[k, j])
+            D = torch.min(D, D[:, :, k:k + 1] + D[:, k:k + 1, :])
+        return D
+
+    def forward(self, X_s, X_t, A_s, A_t):
+        #执行最优传输 Sinkhorn 迭代，求解传输计划。
+        # 节点中心性约束。计算源图(FC)和目标图(HOFC)的节点重要性(PageRank)，作为传输的p和q
+        p = self.compute_pagerank_batch(A_s)  # 源域边缘分布 (维度: [B, N])
+        q = self.compute_pagerank_batch(A_t)  # 目标域边缘分布 (维度: [B, N])
+
+        # 计算节点特征的 Wasserstein 代价 (C_node)
+        # 先对特征按行归一化，然后 bmm 相乘得到余弦相似度，用 1 减去相似度得到距离
+        X_s_norm = F.normalize(X_s, p=2, dim=-1)
+        X_t_norm = F.normalize(X_t, p=2, dim=-1)
+
+        C_node = 1.0 - torch.bmm(X_s_norm, X_t_norm.transpose(-1, -2))
+
+        # 提取图的拓扑距离矩阵 (使用最短路径作为各域内的基础结构距离)
+        C1_intra = self.compute_shortest_path(A_s)
+        C2_intra = self.compute_shortest_path(A_t)
+
+        # 初始化传输计划矩阵 (外积 p * q^T)
+        f_plan = p.unsqueeze(-1) * q.unsqueeze(-2)  # 初始化联合分布 (维度: [B, N, N])
+
+        C1_sq = C1_intra ** 2
+        C2_sq = C2_intra ** 2
+        c1_sq_p = torch.bmm(C1_sq, p.unsqueeze(-1))
+        c2_sq_q = torch.bmm(C2_sq.transpose(-1, -2), q.unsqueeze(-1))
+
+        const_gw = c1_sq_p + c2_sq_q.transpose(-1, -2)
+        v = q
+
+        # Sinkhorn 迭代寻优
+        for _ in range(self.max_iter):
+            
+            cross_term = -2.0 * torch.bmm(C1_intra, torch.bmm(f_plan, C2_intra.transpose(-1, -2)))
+
+            # GW 结构代价：常量项 + 交叉项
+            C_GW = const_gw + cross_term  # 结构代价更新
+
+            # 将特征代价 (C_node) 和 结构代价 (C_GW) 按 alpha 权重融合
+            C_eff = torch.nan_to_num(self.alpha * C_node + (1 - self.alpha) * C_GW, nan=1.0, posinf=1.0,
+                                     neginf=0.0)  # 综合代价矩阵
+
+            K = torch.exp(-torch.clamp(C_eff / (self.epsilon + 1e-6), max=15.0))
+
+            # 交替更新行乘子 u 和列乘子 v，强迫矩阵 K 的行和列分别满足 p 和 q 的分布限制
+            u = p / (torch.matmul(K, v.unsqueeze(-1)).squeeze(-1) + 1e-9)
+            v = q / (torch.matmul(K.transpose(-1, -2), u.unsqueeze(-1)).squeeze(-1) + 1e-9)
+
+            # 用更新后的乘子 u, v 缩放 K，得到当前轮次最新的传输计划 f_plan
+            u = torch.nan_to_num(u, nan=1.0)
+            v = torch.nan_to_num(v, nan=1.0)
+
+            f_plan = u.unsqueeze(-1) * K * v.unsqueeze(-2)  # 更新传输计划 (维度: [B, N, N])
+
+        # C_eff 是算好的综合代价矩阵 (alpha * C_node + (1-alpha) * C_GW)
+        # 逐元素相乘得到演化图 G_{t-1}
+        G_teg = C_eff * f_plan
+
+        return G_teg
+
+class SharedSubspaceGenerator(nn.Module):
+
+    #自适应地学习一个 0-1 硬掩膜(Hard Mask)，将特征非线性解耦，分配到对应的脑功能子空间。
+
+    def __init__(self, in_features, num_nodes=90, hidden_dim=32, num_subspaces=9):
+        super().__init__()
+        self.gcn_assign = GraphConvolution(in_features, hidden_dim)
+
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim), 
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, num_subspaces)
+        )
+
+        self.tao = nn.Parameter(torch.ones(1, 1, num_subspaces) * 1.0)
+
+    def forward(self, node_features, adj):
+
+        h_s = F.leaky_relu(self.gcn_assign(node_features, adj), negative_slope=0.2)  # [B, 90, 32]
+        
+        # 不转置特征，直接在节点维度上进行分配 (节点注意力)
+        s_logits = self.mlp(h_s)  # 获取分配对数：[B, 90, 9]
+
+        s_prob = torch.sigmoid(s_logits)  # 转换为 0~1 的连续概率：[B, 90, 9]
+
+        return None, s_prob
+
+class LabelSmoothingLoss(nn.Module):
+    def __init__(self, smoothing=0.1):
+        super().__init__()
+        self.smoothing = smoothing
+
+    def forward(self, pred, target):
+        log_prob = F.log_softmax(pred, dim=-1)
+
+        target_dist = torch.ones_like(pred) * (self.smoothing / pred.size(-1))
+
+        target_dist.scatter_(1, target.unsqueeze(1).long(), 1.0 - self.smoothing + (self.smoothing / pred.size(-1)))
+
+        return (-target_dist * log_prob).sum(dim=1).mean()
+
+
+class SubspaceSelfAttention(nn.Module):
+    #跨子空间自注意力分类器 ，带状态身份编码与展平分类
+
+    def __init__(self, num_subspaces=9, num_nodes=90, hidden_dim=32, num_classes=2):
+        super().__init__()
+        # 特征降维 [B, 9, 90] -> [B, 9, 32]
+        self.pre_proj = nn.Linear(num_nodes, hidden_dim)
+
+        # 为子空间赋予身份标识
+        self.state_embeddings = nn.Parameter(torch.randn(1, num_subspaces, hidden_dim))
+
+        self.attention = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True, dropout=0.1)
+
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim * 2, hidden_dim)
+        )
+
+        # 展平后的特征设计分类器，直接接收 9 * 64 = 576 维的信息
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.1),
+            nn.Linear(num_subspaces * hidden_dim, 16),
+            nn.LeakyReLU(0.1),
+            nn.Linear(16, num_classes)
+        )
+
+    def forward(self, x):
+        # x 维度: [B, 9, 90]
+        h = self.pre_proj(x)  # [B, 9, 64]
+
+        # 注入状态身份编码
+        h = h + self.state_embeddings
+
+        # 自注意力交互计算
+        attn_out, attn_weights = self.attention(h, h, h)
+        h = self.norm1(h + attn_out)
+
+        # FFN 与残差连接
+        ffn_out = self.ffn(h)
+        h = self.norm2(h + ffn_out)  # [B, 9, 64]
+
+        # 直接将 9 个融合后的状态展平
+        global_repr = h.view(h.size(0), -1)  # [B, 576]
+
+        # 输出分类结果
+        logits = self.classifier(global_repr)
+
+        return logits, attn_weights
+
+
+class HybridADHDModel(nn.Module):
+
+    def __init__(self, num_nodes=90, in_dim=90, prior_dim=6, hidden_dim=32, num_subspaces=9, num_classes=2):
+        super().__init__()
+        self.num_nodes = num_nodes
+        self.num_subspaces = num_subspaces
+        self.hidden_dim = hidden_dim
+
+        # 先验特征的线性变换矩阵 
+        self.W_sub_fc = nn.Linear(in_dim, hidden_dim, bias=False)
+        self.W_sub_hofc = nn.Linear(in_dim, hidden_dim, bias=False)
+
+        # 初始特征提取的 GCN 
+        self.fc_gcn_initial = GraphConvolution(in_dim, hidden_dim)
+        self.hofc_gcn_initial = GraphConvolution(in_dim, hidden_dim)
+
+        # 用于 TJG 模块计算前置特征的线性变换
+        self.teg_fc_nn = nn.Linear(in_dim, hidden_dim)
+        self.teg_hofc_nn = nn.Linear(in_dim, hidden_dim)
+        self.teg_module = TJGModule()
+
+        # 共享特征子空间分配生成器 (生成 0-1 截断掩膜)
+        self.shared_S_generator = SharedSubspaceGenerator(
+            in_features=hidden_dim * 2, num_nodes=num_nodes, hidden_dim=hidden_dim, num_subspaces=num_subspaces
+        )
+
+        sub_dim_1 = 8
+        sub_dim_2 = 2
+
+        # 第一层和第二层 GCN 在每个子空间都是独立的，不共享权重
+
+        self.subspace_gcn_fc_1 = nn.ModuleList([GraphConvolution(hidden_dim, sub_dim_1) for _ in range(num_subspaces)])
+        self.subspace_gcn_fc_2 = nn.ModuleList([GraphConvolution(sub_dim_1, sub_dim_2) for _ in range(num_subspaces)])
+        self.subspace_gcn_hofc_1 = nn.ModuleList([GraphConvolution(hidden_dim, sub_dim_1) for _ in range(num_subspaces)])
+        self.subspace_gcn_hofc_2 = nn.ModuleList([GraphConvolution(sub_dim_1, sub_dim_2) for _ in range(num_subspaces)])
+
+        fusion_dim = sub_dim_2 * 2  
+
+        self.fusion_mlp = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(fusion_dim, fusion_dim * 2),
+                nn.ReLU(),
+                nn.Linear(fusion_dim * 2, fusion_dim)
+            ) for _ in range(num_subspaces)
+        ])
+
+        # 使用线性层将融合后的 4 维特征压缩为 1 维标量，为每个子空间独立分配
+        self.feature_compressors = nn.ModuleList([
+            nn.Linear(fusion_dim, 1) for _ in range(num_subspaces)
+        ])
+
+        self.subspace_attention_classifier = SubspaceSelfAttention(
+            num_subspaces=num_subspaces,
+            num_nodes=self.num_nodes,
+            hidden_dim=64,
+            num_classes=num_classes
+        )
+
+    def forward(self, fc_feat, hofc_feat, fc_adj, hofc_adj, aal_prior, fc_mask=None, hofc_mask=None):
+        B = fc_adj.shape[0]
+        # 应用 T-test 先验掩膜进行严格筛选
+        # T-test 掩膜
+        if fc_mask is not None and hofc_mask is not None:
+
+            # 确保掩膜维度 [N, N] 可以安全广播到 [B, N, N]
+            mask_fc_exp = fc_mask.unsqueeze(0)
+            mask_hofc_exp = hofc_mask.unsqueeze(0)
+
+            # 仅保留具有统计学显著差异的连接，剔除伪相关噪声
+            fc_adj_filtered = fc_adj * mask_fc_exp
+            hofc_adj_filtered = hofc_adj * mask_hofc_exp
+
+            fc_feat_filtered = fc_feat * mask_fc_exp
+            hofc_feat_filtered = hofc_feat * mask_hofc_exp
+        else:
+            fc_adj_filtered, hofc_adj_filtered = fc_adj, hofc_adj
+            fc_feat_filtered, hofc_feat_filtered = fc_feat, hofc_feat
+
+        # 对极度稀疏后的图进行归一化（包含自环，保障孤立节点不会报错）
+        norm_fc_adj = normalize_adj_batch(fc_adj_filtered)  # 增加自环和归一化
+        norm_hofc_adj = normalize_adj_batch(hofc_adj_filtered)
+
+        G_teg = self.teg_module(fc_feat_filtered, hofc_feat_filtered, norm_fc_adj, norm_hofc_adj)
+
+        # 对称化
+        teg_adj_sym = (G_teg + G_teg.transpose(-1, -2)) / 2.0
+
+        # 使用源拓扑的“并集”作为硬掩膜 (Union Mask)，只要 FC 或 HOFC 在某个位置存在连接 (值大于极小值)，就允许演化图响应该连接
+
+        mask_union = ((norm_fc_adj > 0) | (norm_hofc_adj > 0)).float()
+
+        # 当前 teg_adj_sym 的值越小代表节点间关系越密切（传输代价低）
+
+        max_val = teg_adj_sym.max(dim=-1, keepdim=True)[0].max(dim=-2, keepdim=True)[0] + 1e-8
+        teg_adj_norm = teg_adj_sym / max_val  # 归一化到 [0, 1]
+        alpha = 50.0  
+        teg_adj_sym = torch.exp(-alpha * teg_adj_norm)
+        teg_adj_sym = teg_adj_sym * mask_union
+
+        P_T = aal_prior.transpose(1, 2)  # 先验矩阵转置 [B, 6, 90]
+
+        # 采用均值池化 (Mean Pooling) 
+        subnet_node_counts = P_T.sum(dim=-1, keepdim=True) + 1e-8
+        P_T_norm = P_T / subnet_node_counts
+
+        H_sub_fc = torch.bmm(P_T_norm, fc_feat_filtered)
+        H_sub_hofc = torch.bmm(P_T_norm, hofc_feat_filtered)
+
+        A_sub_fc = torch.bmm(torch.bmm(P_T_norm, norm_fc_adj), aal_prior)
+        A_sub_hofc = torch.bmm(torch.bmm(P_T_norm, norm_hofc_adj), aal_prior)
+
+        Out_fc = F.relu(torch.bmm(A_sub_fc, self.W_sub_fc(H_sub_fc)))  # 子网络图空间卷积 [B, 6, 32]，本质GCN
+        Out_hofc = F.relu(torch.bmm(A_sub_hofc, self.W_sub_hofc(H_sub_hofc)))
+
+        # 使用 Softmax 归一化注意力权重，严格控制在 [0, 1] 区间
+        w_net_fc_logits = Out_fc.mean(dim=-1, keepdim=True)
+        w_net_hofc_logits = Out_hofc.mean(dim=-1, keepdim=True)
+        w_net_fc = F.softmax(w_net_fc_logits, dim=1)  # [B, 6, 1]
+        w_net_hofc = F.softmax(w_net_hofc_logits, dim=1)  # [B, 6, 1]
+
+        v_node_fc = torch.bmm(aal_prior, w_net_fc).squeeze(-1)
+        v_node_hofc = torch.bmm(aal_prior, w_net_hofc).squeeze(-1)
+        W_diag_fc = torch.diag_embed(v_node_fc)  # 转换为对角阵以便加权特征 [B, 90, 90]
+        W_diag_hofc = torch.diag_embed(v_node_hofc)
+
+        # 先验注意力加权后的初始特征矩阵 [B, 90, 90]
+        x_fc_prior_in = torch.bmm(W_diag_fc, fc_feat_filtered)
+        x_hofc_prior_in = torch.bmm(W_diag_hofc, hofc_feat_filtered)
+
+        # prior-guided GCN output，提取用于送入子空间的图卷积骨干特征 [B, 90, 32]
+        h_fc_0 = F.relu(self.fc_gcn_initial(x_fc_prior_in, norm_fc_adj))
+        h_hofc_0 = F.relu(self.hofc_gcn_initial(x_hofc_prior_in, norm_hofc_adj))
+
+        # 软性稀疏子空间门控 (Soft Sparse Gating)
+        # 融合矩阵的 GCN output
+        # 摒弃冗余的二次注意力 (去除了 torch.bmm(W_diag_fc, h_fc_0))
+        h_combined = torch.cat([h_fc_0, h_hofc_0], dim=-1)
+
+        # 使用连续的 Sigmoid 概率 s_prob 作为软掩膜
+        # shared_S_generator: GCN+2 Dense+ sigmoid
+        _, s_prob = self.shared_S_generator(h_combined, teg_adj_sym)
+        # s_prob 是 [B, 90, 9]，转置为 [B, 9, 90]，再扩展为 [B, 9, 90, 1]
+        S_exp = s_prob.transpose(1, 2).unsqueeze(-1)  # [B, 9, 90, 1]
+
+        h_fc_0_exp = h_fc_0.unsqueeze(1)  # 源特征升维: [B, 1, 90, 32]
+        h_hofc_0_exp = h_hofc_0.unsqueeze(1)
+
+        # =通过广播机制进行节点级的 0-1 门控过滤，节点级的加权，所有 32 个特征共享同一个节点权重
+        x_fc_sub = h_fc_0_exp * S_exp  # [B, 9, 90, 32]
+        x_hofc_sub = h_hofc_0_exp * S_exp
+
+        subspace_embeddings = []
+
+        for i in range(self.num_subspaces):
+            # 切片获取独立子空间的特征数据 [B, 90, 32]
+            x_fc_i = x_fc_sub[:, i, :, :]
+            x_hofc_i = x_hofc_sub[:, i, :, :]
+
+            # 针对节点特征矩阵 (而非邻接矩阵) 使用 Dropout 增强泛化
+            x_fc_i = F.dropout(x_fc_i, p=0.1, training=self.training)  # 在training时执行这个操作
+            x_hofc_i = F.dropout(x_hofc_i, p=0.1, training=self.training)
+
+            z_fc_1 = F.relu(self.subspace_gcn_fc_1[i](x_fc_i, norm_fc_adj))
+            z_fc_2 = F.relu(self.subspace_gcn_fc_2[i](z_fc_1, norm_fc_adj))
+
+            z_hofc_1 = F.relu(self.subspace_gcn_hofc_1[i](x_hofc_i, norm_hofc_adj))
+            z_hofc_2 = F.relu(self.subspace_gcn_hofc_2[i](z_hofc_1, norm_hofc_adj))
+
+            # 模态拼接与非线性融合
+            concat_feat_i = torch.cat([z_fc_2, z_hofc_2], dim=-1)  # [B, 90, 4]
+            fused_nodes_i = self.fusion_mlp[i](concat_feat_i)  # [B, 90, 4]
+
+            # 在特征维度上进行可学习压缩，fused_nodes_i 经过线性层变为 [B, 90, 1]，然后 squeeze 掉最后一维得到 [B, 90]
+            compressed_nodes_i = self.feature_compressors[i](fused_nodes_i).squeeze(-1)
+
+            subspace_embeddings.append(compressed_nodes_i)
+
+        # 核将 9 个 [B, 90] 堆叠为 [B, 9, 90] 的序列矩阵，dim=1 表示在第 1 个维度 (序列维度) 拼接
+        stacked_embedding = torch.stack(subspace_embeddings, dim=1)  # 维度: [B, 9, 90]
+
+        # 送入注意力模块进行高维交叉诊断
+        # logits: [B, 2] | state_attn_matrix: [B, 9, 9]
+        logits, state_attn_matrix = self.subspace_attention_classifier(stacked_embedding)
+
+        return logits, s_prob, teg_adj_sym, x_fc_sub, state_attn_matrix
