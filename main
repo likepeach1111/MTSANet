@@ -1,0 +1,544 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix
+import numpy as np
+import os
+from data_loader import BrainDataLoader
+from model_architecture import LabelSmoothingLoss, HybridADHDModel
+import pandas as pd
+import torch.nn.functional as F
+from scipy import stats
+import warnings
+from scipy import stats
+from config import Config
+import shutil
+
+# 初始化固定各类工具库的随机种子发生器
+#torch.manual_seed(Config.RANDOM_STATE)
+#np.random.seed(Config.RANDOM_STATE)
+#if torch.cuda.is_available():
+    #torch.cuda.manual_seed_all(Config.RANDOM_STATE)
+def set_random_seed(seed):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def global_t_test_analysis(fc_data, labels, top_k=150, p_threshold=0.01):
+    '''
+    对整个数据集的FC矩阵进行组间 t-test，返回前K条显著边的信息和mask矩阵。
+    fc_data: [B, 90, 90] 的特征/邻接矩阵
+    labels: [B] 的标签 (0 或 1)
+    top_k: 要返回的前K条显著边数量
+    p_threshold: 显著性阈值
+    '''
+    # 分离正负样本
+    data_pos = fc_data[labels == 1].numpy()
+    data_neg = fc_data[labels == 0].numpy()
+
+    with warnings.catch_warnings(), np.errstate(divide='ignore', invalid='ignore'):
+        warnings.simplefilter("ignore")
+        t_stat, p_vals = stats.ttest_ind(data_pos, data_neg, axis=0, equal_var=False)
+
+    p_vals = np.nan_to_num(p_vals, nan=1.0)
+    t_stat = np.nan_to_num(t_stat, nan=0.0)
+
+    # 取上三角部分
+    N = p_vals.shape[0]
+    p_vals_triu = np.triu(p_vals, k=1)
+    t_stat_triu = np.triu(t_stat, k=1)
+
+    # 收集所有上三角的边
+    all_edges = []
+    for i in range(N):
+        for j in range(i + 1, N):
+            all_edges.append((i, j, p_vals_triu[i, j], t_stat_triu[i, j]))
+
+    # 按p值从小到大排序
+    all_edges.sort(key=lambda x: x[2])
+
+    # 强制截取前 top_k 条边
+    top_edges = all_edges[:top_k]
+
+    # 创建mask矩阵
+    mask = np.zeros((N, N), dtype=np.float32)
+    for i, j, _, _ in top_edges:
+        mask[i, j] = 1.0
+        mask[j, i] = 1.0
+
+    significant_in_top_k = sum(1 for edge in top_edges if edge[2] <= p_threshold)
+    total_edges_triu = N * (N - 1) // 2
+
+    return torch.tensor(mask), top_edges
+
+
+def remove_isolated_nodes(fc_data, hofc_data, mask, prior, top_edges=None):
+    '''
+    根据mask去除孤立节点（度数为0的节点），更新fc_data, hofc_data, mask和prior
+    参数:
+        fc_data: [B, N, N] FC矩阵
+        hofc_data: [B, N, N] HOFC矩阵
+        mask: [N, N] 显著边mask矩阵
+        prior: [N, P] AAL先验信息
+        top_edges: 显著边列表，每条边为 (i, j, p_val, t_val)
+    返回:
+        updated_fc, updated_hofc, updated_mask, updated_prior, kept_indices, updated_top_edges
+    '''
+    # 计算每个节点的度数
+    node_degrees = mask.sum(dim=1).numpy()
+
+    # 找出非孤立节点的索引
+    kept_indices = np.where(node_degrees > 0)[0]
+
+    # 创建旧索引到新索引的映射
+    old_to_new = {old_idx: new_idx for new_idx, old_idx in enumerate(kept_indices)}
+
+    # 更新所有数据结构
+    updated_fc = fc_data[:, kept_indices, :][:, :, kept_indices]
+    updated_hofc = hofc_data[:, kept_indices, :][:, :, kept_indices]
+    updated_mask = mask[kept_indices, :][:, kept_indices]
+    updated_prior = prior[kept_indices, :]
+
+    # 更新top_edges中的节点索引
+    updated_top_edges = None
+    if top_edges is not None:
+        updated_top_edges = []
+        for i, j, p_val, t_val in top_edges:
+            if i in old_to_new and j in old_to_new:
+                new_i = old_to_new[i]
+                new_j = old_to_new[j]
+                updated_top_edges.append((new_i, new_j, p_val, t_val))
+
+    return updated_fc, updated_hofc, updated_mask, updated_prior, kept_indices, updated_top_edges
+
+
+def get_significant_edge_mask(train_data, train_labels, top_k=150, p_threshold=0.01):
+    #仅使用训练集计算组间 t-test，返回包含最显著 top_k 条边的 0-1 掩膜。
+    # 分离正负样本
+    data_pos = train_data[train_labels == 1].cpu().numpy()
+    dat_neg = train_data[train_labels == 0].cpu().numpy()
+
+    with warnings.catch_warnings(), np.errstate(divide='ignore', invalid='ignore'):
+        warnings.simplefilter("ignore")
+        t_stat, p_vals = stats.ttest_ind(data_pos, dat_neg, axis=0, equal_var=False)
+
+    p_vals = np.nan_to_num(p_vals, nan=1.0)
+
+    # 取上三角部分
+    N = p_vals.shape[0]
+    p_vals_triu = np.triu(p_vals, k=1)
+    p_vals_triu[p_vals_triu == 0] = 1.0  # 排除下三角和对角线的 0
+
+    thresholded_p_mask = (p_vals_triu <= p_threshold)
+    filtered_p_vals = p_vals_triu[thresholded_p_mask]
+
+    if filtered_p_vals.size == 0:
+
+        return torch.zeros((N, N), dtype=torch.float32)
+    else:
+
+        sorted_filtered_p = np.sort(filtered_p_vals)
+
+        actual_top_k = min(top_k, len(sorted_filtered_p))
+        threshold_p_for_top_k = sorted_filtered_p[actual_top_k - 1] if actual_top_k > 0 else p_threshold
+
+        # 生成对称的 0-1 掩膜矩阵
+        mask_upper = (p_vals_triu <= threshold_p_for_top_k) & (p_vals_triu <= p_threshold)
+        mask_upper = mask_upper.astype(np.float32)
+        mask = mask_upper + mask_upper.T
+
+    return torch.tensor(mask)
+
+
+def train_model(model, train_loader, criterion, optimizer, device, fc_mask, hofc_mask,
+                model_type='fc_hofc_prior', aux_weight1 = 1.0, aux_weight2 = 1.0):
+    
+    model.train()  
+    running_loss = 0.0
+    running_loss_cls = 0.0
+    running_loss_sub = 0.0
+    all_preds = []
+    all_labels = []
+
+    for batch_data in train_loader:
+        if model_type == 'fc_hofc_prior':
+            fc_raw, hofc_raw, labels, prior = batch_data
+            fc_raw, hofc_raw, labels, prior = fc_raw.to(device), hofc_raw.to(device), labels.to(device), prior.to(
+                device)
+
+            # 克隆输入作为模型的特征与拓扑矩阵
+            fc_feat, fc_adj = fc_raw.clone(), fc_raw.clone()
+            hofc_feat, hofc_adj = hofc_raw.clone(), hofc_raw.clone()
+
+            # logits 为分类得分；s_prob 是分配到隐子空间的概率
+            outputs, s_prob, teg_adj_sym, _, state_attn_matrix = model(fc_feat, hofc_feat, fc_adj, hofc_adj, prior,
+                                                                       fc_mask, hofc_mask)
+            # 复合损失函数计算
+            # 交叉熵分类损失
+            loss_cls = criterion(outputs, labels)
+
+            # 二项分布伯努利信息熵 (Bernoulli Entropy Regularization)强烈惩罚 0.5 左右的不确定值，逼迫模型的掩膜特征倾向 0 或 1，产生严格门控断路。
+            epsilon = 1e-8
+            entropy = - (s_prob * torch.log(s_prob + epsilon) + (1.0 - s_prob) * torch.log(1.0 - s_prob + epsilon))
+            
+            loss_entropy = entropy.mean()  
+
+            s_prob_centered = s_prob - s_prob.mean(dim=1, keepdim=True)
+
+            s_prob_norm = F.normalize(s_prob_centered, p=2, dim=1)
+
+            sim_matrix = torch.bmm(s_prob_norm.transpose(1, 2), s_prob_norm)
+
+            identity = torch.eye(sim_matrix.size(-1), device=device).unsqueeze(0)
+
+            # 计算 Frobenius 范数惩罚
+            loss_ortho = torch.norm(sim_matrix - identity, p='fro', dim=(1, 2)).mean()
+            # ==============================================================
+
+            loss_sub = aux_weight1 * loss_entropy + aux_weight2 * loss_ortho
+
+            loss = loss_cls + loss_sub
+
+
+        optimizer.zero_grad()  
+        loss.backward()  
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+        optimizer.step()  
+
+        running_loss += loss.item() * fc_raw.size(0)
+        running_loss_cls += loss_cls.item() * fc_raw.size(0)
+        running_loss_sub += loss_sub.item() * fc_raw.size(0)
+
+        preds = torch.argmax(outputs, dim=1)
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+
+    total_samples = len(train_loader.dataset)
+    epoch_loss = running_loss / total_samples
+    epoch_loss_cls = running_loss_cls / total_samples
+    epoch_loss_sub = running_loss_sub / total_samples
+    #epoch_loss_pri = running_loss_pri / total_samples
+    epoch_acc = accuracy_score(all_labels, all_preds)
+
+    #return epoch_loss, epoch_acc, epoch_loss_cls, epoch_loss_sub, epoch_loss_pri
+    return epoch_loss, epoch_acc, epoch_loss_cls, epoch_loss_sub
+
+def evaluate_model(model, val_loader, criterion, device, fc_mask, hofc_mask, aux_weight1 = 1.0, aux_weight2 = 1.0):
+    model.eval()
+    running_loss = 0.0
+    all_preds = []
+    all_labels = []
+    all_probs = []  
+
+    with torch.no_grad():
+        for batch_data in val_loader:
+            
+            fc_raw, hofc_raw, labels, prior = batch_data
+
+            fc_raw, hofc_raw = fc_raw.to(device), hofc_raw.to(device)
+            labels, prior = labels.to(device), prior.to(device)
+
+            fc_feat, fc_adj = fc_raw.clone(), fc_raw.clone()
+            hofc_feat, hofc_adj = hofc_raw.clone(), hofc_raw.clone()
+
+            outputs, s_prob, teg_adj_sym, _, state_attn_matrix = model(fc_feat, hofc_feat, fc_adj, hofc_adj, prior,
+                                                                       fc_mask, hofc_mask)
+            loss_cls = criterion(outputs, labels)
+
+            loss_entropy = - (
+                    s_prob * torch.log(s_prob + 1e-8) + (1.0 - s_prob) * torch.log(1.0 - s_prob + 1e-8)).mean()
+           
+            s_prob_centered = s_prob - s_prob.mean(dim=1, keepdim=True)
+
+            s_prob_norm = F.normalize(s_prob_centered, p=2, dim=1)
+           
+            sim_matrix = torch.bmm(s_prob_norm.transpose(1, 2), s_prob_norm)
+            
+            identity = torch.eye(sim_matrix.size(-1), device=device).unsqueeze(0)
+
+            loss_ortho = torch.norm(sim_matrix - identity, p='fro', dim=(1, 2)).mean()
+
+            loss = loss_cls + aux_weight1 * loss_entropy + aux_weight2 * loss_ortho
+
+            running_loss += loss.item() * fc_raw.size(0)
+
+            
+            _, preds = torch.max(outputs, 1)
+            probs = F.softmax(outputs, dim=1)[:, 1]  
+
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
+
+    val_loss = running_loss / len(val_loader.dataset)
+    val_acc = accuracy_score(all_labels, all_preds)
+
+    if len(np.unique(all_labels)) > 1:
+        val_auc = roc_auc_score(all_labels, all_probs)
+    else:
+        val_auc = 0.5
+
+    cm = confusion_matrix(all_labels, all_preds, labels=[0, 1])
+    if cm.shape == (2, 2):
+        tn, fp, fn, tp = cm.ravel()
+        val_sens = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        val_spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    else:
+        val_sens, val_spec = 0.0, 0.0
+
+    return val_loss, val_acc, val_auc, val_sens, val_spec, all_labels, all_preds, all_probs
+
+
+def main(top_k=Config.TOP_K_EDGES, num_subspaces=Config.NUM_SUBSPACES, random_state=Config.RANDOM_STATE, aux_weight1=0.2, aux_weight2=0.001):
+    set_random_seed(random_state)
+
+    print(f"\n[Experiment Setting] Top-K: {top_k}, Subspaces: {num_subspaces}, Seed: {random_state}")
+
+    #10折交叉验证主函数 在每一折的测试集上寻找最佳模型，监控多维度 Loss，并最终输出 10 折平均成绩。
+ 
+    loader = BrainDataLoader()
+    fc_tensor, hofc_tensor, labels_tensor = loader.get_data()
+    excel_path = "region_大脑网络分区.xlsx"
+    prior_single_tensor = loader.load_aal_prior1(xlsx_path=excel_path, num_nodes=Config.NUM_NODES)
+
+    print(f"\n==============================================")
+    print(f"数据加载与空间池化汇总完毕:")
+    print(f"FC Matrix:   {fc_tensor.shape}")
+    print(f"HOFC Matrix: {hofc_tensor.shape}")
+    print(f"标签分布:    {labels_tensor.shape}")
+    print(f"AAL先验信息: {prior_single_tensor.shape}")
+    print(f"设备:  {Config.DEVICE}")
+    print(f"==============================================\n")
+
+    # 传入 top_k
+    global_fc_mask, global_top_edges = global_t_test_analysis(
+        fc_tensor, labels_tensor, top_k=top_k, p_threshold=0.01
+    )
+
+    # 根据global_fc_mask去除孤立节点
+    # 此时输出的所有值为去除孤立节点后的值
+    print(f"[数据预处理] 开始去除孤立节点...")
+    fc_tensor, hofc_tensor, global_fc_mask, prior_single_tensor, kept_indices, global_top_edges = remove_isolated_nodes(
+        fc_tensor, hofc_tensor, global_fc_mask, prior_single_tensor, global_top_edges
+    )
+
+    
+    NUM_NODES = fc_tensor.shape[1]
+    FEATURE_DIM = fc_tensor.shape[1]
+
+    
+    N = fc_tensor.shape[0]
+    prior_tensor = prior_single_tensor.unsqueeze(0).repeat(N, 1, 1)
+
+    
+    print(f"\n==============================================")
+    print(f"孤立节点去除后信息:")
+    print(f"FC Matrix:   {fc_tensor.shape}")
+    print(f"HOFC Matrix: {hofc_tensor.shape}")
+    print(f"标签分布:    {labels_tensor.shape}")
+    print(f"AAL先验信息: {prior_tensor.shape}")
+    print(f"显著边Mask:  {global_fc_mask.shape}")
+    print(f"==============================================\n")
+
+    labels_np = labels_tensor.numpy()
+
+    # 10 折分层交叉验证
+    skf = StratifiedKFold(n_splits=Config.K_FOLDS, shuffle=True, random_state=random_state)
+
+    # 用于收集每一折的最好成绩
+    fold_results = []
+    os.makedirs('saved_models', exist_ok=True)
+
+    print(f"\n>>>>================== 开始 {Config.K_FOLDS} 折 Train/Test 交叉验证 ==================<<<<")
+
+    for fold, (train_idx, test_idx) in enumerate(skf.split(np.zeros(N), labels_np)):
+        print(f"正在执行 Fold {fold + 1}/{Config.K_FOLDS}")
+
+        # 根据索引切分出当前折的训练集和测试集
+        train_fc, test_fc = fc_tensor[train_idx], fc_tensor[test_idx]
+        train_hofc, test_hofc = hofc_tensor[train_idx], hofc_tensor[test_idx]
+        train_labels, test_labels = labels_tensor[train_idx], labels_tensor[test_idx]
+        train_prior, test_prior = prior_tensor[train_idx], prior_tensor[test_idx]
+
+        # 动态捕捉当前训练折次的类别不均衡分布
+        num_pos = torch.sum(train_labels == 1).item()
+        num_neg = torch.sum(train_labels == 0).item()
+        weight_pos = num_neg / num_pos if num_pos > 0 else 1.0
+        class_weights = torch.tensor([1.0, weight_pos]).to(Config.DEVICE)
+
+        # 计算当前折的 T-test 特征掩膜,此时模板为公用global_fc_mask
+
+        fc_mask = global_fc_mask.clone().to(Config.DEVICE)
+        hofc_mask = global_fc_mask.clone().to(Config.DEVICE)
+
+
+        train_dataset = TensorDataset(train_fc, train_hofc, train_labels, train_prior)
+        test_dataset = TensorDataset(test_fc, test_hofc, test_labels, test_prior)
+
+
+        train_loader = DataLoader(train_dataset, batch_size=Config.BATCH_SIZE, shuffle=True)
+        test_loader = DataLoader(test_dataset, batch_size=Config.BATCH_SIZE, shuffle=False)
+
+
+        model = HybridADHDModel(
+            num_nodes=NUM_NODES,
+            in_dim=FEATURE_DIM,
+            prior_dim=prior_single_tensor.shape[1],
+            hidden_dim=Config.HIDDEN_DIM,
+            num_subspaces=num_subspaces,  
+            num_classes=Config.NUM_CLASSES
+        ).to(Config.DEVICE)
+
+        criterion = LabelSmoothingLoss(smoothing=0.3)
+
+        optimizer = optim.AdamW(model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY)
+
+        model_save_dir = f"saved_models/topk_{top_k}_sub{num_subspaces}_seed{random_state}"
+        os.makedirs(model_save_dir, exist_ok=True)
+        best_model_path = f"{model_save_dir}/best_model_fold_{fold + 1}.pth"
+
+        # 当前折的最好结果
+        best_test_acc = 0.0
+        best_test_metrics = {}
+        best_epoch = 0
+
+        # 早停
+        patience = 180
+        patience_counter = 0
+
+        for epoch in range(Config.EPOCHS):
+            # 训练阶段
+            train_loss, train_acc, train_loss_cls, train_loss_sub = train_model(
+                model, train_loader, criterion, optimizer, Config.DEVICE, fc_mask, hofc_mask,
+                aux_weight1 = aux_weight1, aux_weight2 = aux_weight2
+            )
+
+            # 测试阶段
+            test_loss, test_acc, test_auc, test_sens, test_spec, test_labels_out, test_preds, test_probs = evaluate_model(
+                model, test_loader, criterion, Config.DEVICE, fc_mask, hofc_mask, aux_weight1 = aux_weight1, aux_weight2 = aux_weight2
+            )
+            saved_marker = ""
+
+            # 在测试集上挑选最高 Acc 的那一次
+            is_best = test_acc > best_test_acc
+
+            if is_best:
+                best_test_acc = test_acc
+                best_epoch = epoch + 1
+                best_test_metrics = {'acc': test_acc, 'auc': test_auc, 'sens': test_sens, 'spec': test_spec}
+
+                # 存盘当前折的最佳模型
+                torch.save(model.state_dict(), best_model_path)
+                saved_marker = "  [测试集新高，存档覆盖！]"
+                patience_counter = 0
+
+                # 仅保存当前折最佳 epoch 的预测结果
+                df_preds = pd.DataFrame({
+                    'True_Label': test_labels_out,
+                    'Predicted_Class': test_preds,
+                    'Predicted_Prob': test_probs
+                })
+                df_preds.to_csv(f"Best_Test_Predictions_Fold_{fold + 1}.csv", index=False)
+            else:
+                patience_counter += 1
+
+            # 打印拆解后的独立 Loss
+            print(f"E[{epoch + 1:03d}/{Config.EPOCHS}] "
+                  f"Train Ls: {train_loss:.4f} (Cls: {train_loss_cls:.4f}, Sub: {train_loss_sub:.4f}) | Acc: {train_acc:.4f} || "
+                  f"Test Ls: {test_loss:.4f} | Acc: {test_acc:.4f} | AUC: {test_auc:.4f} | Sens: {test_sens:.4f} | Spec: {test_spec:.4f} {saved_marker}")
+
+            if patience_counter >= patience:
+                print(f"\n [早停触发] 模型在连续 {patience} 轮中未能在测试集上突破。结束当前 Fold。")
+                break
+
+        # 确保至少有一次记录
+        if not best_test_metrics:
+            best_test_metrics = {'acc': test_acc, 'auc': test_auc, 'sens': test_sens, 'spec': test_spec}
+            best_epoch = Config.EPOCHS
+
+        # 记录并输出本 Fold 最终战果
+        fold_results.append(best_test_metrics)
+        print(f"\n Fold {fold + 1} 最终结果 (最强表现捕捉于 Epoch {best_epoch}):")
+        print(f" ->  Test Acc : {best_test_metrics['acc']:.4f}")
+        print(f" ->  Test AUC : {best_test_metrics['auc']:.4f}")
+        print(f" ->  Test Sens: {best_test_metrics['sens']:.4f}")
+        print(f" ->  Test Spec: {best_test_metrics['spec']:.4f}\n")
+
+
+    # 10 折全部完成，计算并打印全局平均统计指标
+
+        # 把每一折的成绩保存为 CSV 文件，存在对应的种子文件夹里
+        df_folds = pd.DataFrame(fold_results)
+        df_folds.index = [f"Fold_{i + 1}" for i in range(len(fold_results))]
+
+        csv_path = f"{model_save_dir}/all_folds_metrics.csv"
+        df_folds.to_csv(csv_path)
+
+        
+
+        try:
+            # 读取保存的每一折成绩
+            df_metrics = pd.read_csv(csv_path, index_col=0)
+
+            # Acc -> AUC -> Sens -> Spec 顺序进行降序排列
+            df_sorted = df_metrics.sort_values(
+                by=['acc', 'auc', 'sens', 'spec'],
+                ascending=[False, False, False, False]
+            )
+
+            # 获取排在第一位的那一折的名字
+            best_fold_name = df_sorted.index[0]
+            # 解析出数字
+            best_fold_idx = best_fold_name.split('_')[1]
+
+            # 找到对应的 pth 文件名
+            source_model_path = os.path.join(model_save_dir, f"best_model_fold_{best_fold_idx}.pth")
+
+            # 定义目标复制路径
+            target_model_path = os.path.join(model_save_dir, "best_model_fold.pth")
+
+            # 执行复制
+            if os.path.exists(source_model_path):
+                shutil.copy2(source_model_path, target_model_path)
+                print(f"\n 已挑选出最强的一折: {best_fold_name}")
+                print(f"指标为 -> Acc: {df_sorted.iloc[0]['acc']:.4f}, AUC: {df_sorted.iloc[0]['auc']:.4f}")
+                print(f"已将该折权重复制为: {target_model_path}")
+            else:
+                print(f"\n未找到要复制的权重文件: {source_model_path}")
+
+        except Exception as e:
+            print(f"\n自动提取最佳模型时发生错误: {e}")
+
+        print(f"\n10-Fold Cross Validation 全局汇总")
+
+    avg_acc = np.mean([res['acc'] for res in fold_results])
+    std_acc = np.std([res['acc'] for res in fold_results])
+
+    avg_auc = np.mean([res['auc'] for res in fold_results])
+    std_auc = np.std([res['auc'] for res in fold_results])
+
+    avg_sens = np.mean([res['sens'] for res in fold_results])
+    std_sens = np.std([res['sens'] for res in fold_results])
+
+    avg_spec = np.mean([res['spec'] for res in fold_results])
+    std_spec = np.std([res['spec'] for res in fold_results])
+
+    print(f"整体 ACC  : {avg_acc:.4f} ± {std_acc:.4f}")
+    print(f"整体 AUC  : {avg_auc:.4f} ± {std_auc:.4f}")
+    print(f"整体 Sens : {avg_sens:.4f} ± {std_sens:.4f}")
+    print(f"整体 Spec : {avg_spec:.4f} ± {std_spec:.4f}")
+    print("=" * 50)
+
+    # 返回 ACC, AUC, SENS, SPEC 四大指标，供外部实验脚本统计
+    return avg_acc, avg_auc, avg_sens, avg_spec
+
+if __name__ == '__main__':
+    main()
