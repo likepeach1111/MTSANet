@@ -1,0 +1,181 @@
+import scipy.io as scio
+import numpy as np
+import torch
+import h5py
+import os
+import pandas as pd
+
+
+class BrainDataLoader:
+    # 同时接收 FC 和 HOFC 的路径列表
+    def __init__(self,
+                 fc_paths=['FC_NYU.mat', 'FC_KKI.mat', 'FC_NeuroIMAGE.mat', 'FC_PU.mat'],
+                 hofc_paths=['HOFC_NYU.mat', 'HOFC_KKI.mat', 'HOFC_NeuroIMAGE.mat', 'HOFC_PU.mat']):
+
+        self.fc_paths = [fc_paths] if isinstance(fc_paths, str) else fc_paths
+        self.hofc_paths = [hofc_paths] if isinstance(hofc_paths, str) else hofc_paths
+
+        if len(self.fc_paths) != len(self.hofc_paths):
+            raise ValueError("FC 文件数量和 HOFC 文件数量必须一致！")
+
+    def _resolve_references(self, f, dataset):
+        data = dataset[:]
+        if data.dtype.kind == 'O' or (hasattr(h5py, 'check_dtype') and h5py.check_dtype(ref=dataset.dtype)):
+            resolved_data = []
+            flat_data = data.flatten()
+            for ref in flat_data:
+                try:
+                    val = f[ref][:]
+                    if val.size == 1:
+                        resolved_data.append(val.item())
+                    else:
+                        resolved_data.append(val)
+                except:
+                    resolved_data.append(ref)
+            return np.array(resolved_data).reshape(data.shape)
+        return data
+
+    # 文件加载器
+    def _load_mat_file(self, filepath, key_candidates):
+        if not os.path.exists(filepath):
+            return None, None
+        data_mat, label_mat = None, None
+
+        # 使用 h5py 读取
+        try:
+            with h5py.File(filepath, 'r') as f:
+                for key in key_candidates:
+                    if key in f:
+                        d = f[key][:]
+                        if d.ndim == 3:
+                            if d.shape[0] == d.shape[1]:
+                                data_mat = d.transpose(2, 0, 1)
+                            else:
+                                data_mat = d
+                        break
+                # 读取疾病标签
+                for label_key in ['label', 'labels', 'All_Group']:
+                    if label_key in f:
+                        l = f[label_key][:]
+                        label_mat = self._resolve_references(f, l)
+                        break
+        except OSError:
+            # 老版本 MATLAB 文件回退到 scipy.io
+            try:
+                mat = scio.loadmat(filepath)
+                for key in key_candidates:
+                    if key in mat:
+                        d = mat[key]
+                        if d.ndim == 3:
+                            data_mat = d.transpose(2, 0, 1)
+                        break
+                for label_key in ['label', 'labels', 'All_Group']:
+                    if label_key in mat:
+                        label_mat = mat[label_key]
+                        break
+            except Exception as e:
+                print(f"无法读取文件 {filepath}: {e}")
+                return None, None
+        return data_mat, label_mat
+
+    def get_data(self):
+        all_fc = []
+        all_hofc = []
+        all_labels = []
+
+        # 并行遍历 FC 和 HOFC 的多中心文件
+        for fc_path, hofc_path in zip(self.fc_paths, self.hofc_paths):
+            print(f"Loading {fc_path} & {hofc_path} ...")
+            if not os.path.exists(fc_path) or not os.path.exists(hofc_path):
+                print(f"  --> [警告] 文件缺失，跳过该站点。")
+                continue
+
+            fc_data, fc_label = self._load_mat_file(fc_path, ['sFC', 'FC', 'fc', 'data', 'All_Bold'])
+            hofc_data, hofc_label = self._load_mat_file(hofc_path, ['HOFC', 'hofc', 'data', 'All_Bold'])
+
+            if fc_data is None or hofc_data is None or fc_label is None:
+                print(f"  --> [警告] 键值未找到，跳过该站点。")
+                continue
+
+            raw_labels = np.array(fc_label).flatten()
+            if np.all(raw_labels >= 48) and np.all(raw_labels <= 57):
+                raw_labels = raw_labels - 48
+
+            final_labels = np.zeros_like(raw_labels)
+            disease_mask = np.isin(raw_labels, [1, 2, 3])
+            final_labels[disease_mask] = 1
+            final_labels[raw_labels == 0] = 0
+
+            fc_tensor = torch.nan_to_num(torch.FloatTensor(fc_data), nan=0.0, posinf=1.0, neginf=-1.0)
+            hofc_tensor = torch.nan_to_num(torch.FloatTensor(hofc_data), nan=0.0, posinf=1.0, neginf=-1.0)
+            label_tensor = torch.LongTensor(final_labels)
+
+            min_len = min(fc_tensor.shape[0], hofc_tensor.shape[0], label_tensor.shape[0])
+            fc_tensor = fc_tensor[:min_len]
+            hofc_tensor = hofc_tensor[:min_len]
+            label_tensor = label_tensor[:min_len]
+
+            all_fc.append(fc_tensor)
+            all_hofc.append(hofc_tensor)
+            all_labels.append(label_tensor)
+            print(f"  --> 该站点成功加载: {fc_tensor.shape[0]} 个受试者样本。")
+
+        if not all_fc:
+            raise ValueError("未能成功加载任何数据集！请检查文件路径和文件名。")
+
+        # 将多个中心的数据拼接，得到全局大数据集
+        final_fc = torch.cat(all_fc, dim=0)
+        final_hofc = torch.cat(all_hofc, dim=0)
+        final_labels = torch.cat(all_labels, dim=0)
+
+        num_normal = torch.sum(final_labels == 0).item()
+        num_disease = torch.sum(final_labels == 1).item()
+
+        print(f"\n======================================")
+        print(f"多中心数据集融合完成")
+        print(f"总样本池大小: {final_fc.shape[0]} 个受试者")
+        print(f"全局标签分布: 正常(0)={num_normal}, 患病(1)={num_disease}")
+        print(f"======================================\n")
+
+        return final_fc, final_hofc, final_labels
+
+    def load_aal_prior1(self, xlsx_path='region_大脑网络分区.xlsx', num_nodes=90):
+        print(f"正在从 {xlsx_path} 提取脑网络先验知识 (训练专用)...")
+        if not os.path.exists(xlsx_path):
+            raise FileNotFoundError(f"找不到文件: {xlsx_path}")
+
+        df = pd.read_excel(xlsx_path, engine='openpyxl', header=None)
+
+        target_col = 10
+        networks = df.iloc[:num_nodes, target_col].astype(str).str.strip().tolist()
+
+        unique_nets = [net for net in list(set(networks)) if net.lower() not in ['nan', 'none']]
+        print(f"检测到 {len(unique_nets)} 种静态脑网络: {unique_nets}")
+
+        mapping = {net: i for i, net in enumerate(unique_nets)}
+        one_hot = torch.zeros(num_nodes, len(unique_nets))
+
+        for i, net in enumerate(networks):
+            if net in mapping:
+                one_hot[i, mapping[net]] = 1.0
+
+        return one_hot
+
+    def load_aal_prior(self, xlsx_path='AAL90大脑网络分区对应Yeo7 .xlsx', num_nodes=90):
+        print(f"正在从 {xlsx_path} 提取脑网络先验知识...")
+        if not os.path.exists(xlsx_path):
+            raise FileNotFoundError(f"找不到文件: {xlsx_path}")
+
+        # 同步切换为 header=0 解析
+        df = pd.read_excel(xlsx_path, engine='openpyxl', header=0)
+
+        target_col = 9
+        networks = df.iloc[:num_nodes, target_col].astype(str).str.strip().tolist()
+
+        unique_nets = list(set(networks))
+        print(f"检测到 {len(unique_nets)} 种静态脑网络: {unique_nets}")
+        mapping = {net: i for i, net in enumerate(unique_nets)}
+        one_hot = torch.zeros(num_nodes, len(unique_nets))
+        for i, net in enumerate(networks):
+            one_hot[i, mapping[net]] = 1.0
+        return one_hot
